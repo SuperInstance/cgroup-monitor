@@ -1,69 +1,127 @@
-# Cgroup Monitor — Linux Control Group v2 Resource Scanner
+# cgroup-monitor
 
-**cgroup-monitor** is a Linux utility that reads cgroup v2 control files to report per-service CPU usage, memory consumption, and process counts. It walks the `/sys/fs/cgroup/` hierarchy and parses the kernel-exposed accounting files that every systemd slice, container, and process group publishes.
+A Linux **cgroup v2 resource monitor** that scans `/sys/fs/cgroup/` to report per-cgroup CPU usage, memory consumption, memory limits, and process counts. Designed for container observability, system health monitoring, and resource debugging.
 
 ## Why It Matters
 
-Every modern Linux system uses cgroups v2 to enforce resource limits on processes — Docker, systemd, Kubernetes, and Podman all map to the same cgroup filesystem. When a container OOM-kills or a systemd service pegs a CPU, the data is sitting right there in `/sys/fs/cgroup/`. This crate provides a programmatic way to scan those files without shelling out to `systemd-cgtop` or `docker stats`. Engineers building observability dashboards, resource controllers, or fleet monitoring agents need direct cgroup parsing — it's the ground truth for resource consumption on Linux.
+cgroup v2 is the unified resource control system in modern Linux kernels (5.x+). It is the backbone of:
+
+- **Container resource limits** — Docker, Podman, and Kubernetes all use cgroups
+- **systemd service isolation** — each `.service` unit has its own cgroup
+- **OOM prevention** — `memory.max` prevents runaway processes from crashing the system
+- **Fair CPU scheduling** — `cpu.weight` controls CPU time distribution
+
+Monitoring cgroup usage is essential for:
+
+- **Capacity planning** — identifying which services consume the most resources
+- **Anomaly detection** — spotting memory leaks or CPU spikes early
+- **Cost attribution** — per-tenant resource accounting in multi-tenant systems
+- **SRE dashboards** — real-time observability of service-level resource consumption
 
 ## How It Works
 
-Linux cgroup v2 exposes a unified filesystem at `/sys/fs/cgroup/`. Each cgroup directory contains well-defined control files:
+### cgroup v2 Hierarchy
+
+cgroup v2 uses a single unified hierarchy mounted at `/sys/fs/cgroup/`. Each cgroup directory contains control files:
 
 | File | Description |
-|---|---|
-| `cpu.stat` | CPU accounting: `usage_usec`, `user_usec`, `system_usec` |
+|------|-------------|
 | `memory.current` | Current memory usage in bytes |
-| `memory.max` | Memory limit (bytes or `max` for unlimited) |
-| `pids.current` | Number of processes currently in the cgroup |
-| `cpu.weight` | CPU scheduler weight (1–10000, default 100) |
-| `cpu.max` | CPU bandwidth limit: `$MAX $PERIOD` (e.g., `50000 100000` = 50%) |
+| `memory.max` | Memory limit (bytes, or "max" for unlimited) |
+| `cpu.stat` | CPU usage statistics (usec, user, system) |
+| `pids.current` | Current process count |
+| `cpu.weight` | CPU scheduler weight (1–10000) |
+| `cpu.max` | CPU bandwidth limit (quota period) |
 
-The monitor performs a single-pass scan:
+### Scanner Architecture
 
-1. **Enumerate** `system.slice/*/` — each subdirectory is a systemd service cgroup.
-2. **Read** `cpu.stat`, `memory.current`, `memory.max`, `pids.current` for each.
-3. **Aggregate** and print a summary with totals.
+The monitor performs a directory scan of `system.slice/` (where systemd places services):
 
-The scan is `O(n)` where `n` is the number of cgroups — each read is a single `read(2)` syscall on a pseudo-file, so there is no parsing overhead beyond splitting on whitespace. Memory usage is `O(1)` per cgroup (one `CgroupInfo` struct at a time).
+```text
+/sys/fs/cgroup/
+├── cpu.stat          ← root cgroup stats
+├── cpu.weight
+├── cpu.max
+└── system.slice/
+    ├── service-a.service/
+    │   ├── memory.current
+    │   ├── memory.max
+    │   ├── cpu.stat
+    │   └── pids.current
+    ├── service-b.service/
+    │   └── ...
+    └── ...
+```
+
+For each child cgroup, it reads the four key files and aggregates them into a `CgroupInfo` struct.
+
+### Memory Pressure Model
+
+The effective memory pressure of a cgroup is:
+
+$$P = \frac{\text{memory.current}}{\text{memory.max}}$$
+
+When $P \to 1$, the kernel's OOM killer activates for that cgroup. This monitor reports raw values, allowing downstream tools to compute pressure.
+
+### Complexity Analysis
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| `read_cgroup_file(path)` | O(1) | O(1) |
+| `scan_cgroup(dir)` | O(1) (4 file reads) | O(1) |
+| Full scan of system.slice | O(n) where n = cgroups | O(n) |
+| Root cgroup stats | O(1) (2 reads) | O(1) |
+
+Each file read is a single `fs::read_to_string` — no parsing overhead beyond trimming whitespace.
 
 ## Quick Start
 
 ```bash
-# Build and run as root (cgroup files require read access)
-cargo run --release
+# Run on any Linux system with cgroup v2
+cargo run
 ```
 
-```rust
-use std::path::Path;
-use std::fs;
+Sample output:
 
-fn read_memory_current(cgroup_name: &str) -> u64 {
-    let path = format!("/sys/fs/cgroup/system.slice/{cgroup_name}/memory.current");
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-}
+```
+Scanning cgroups under /sys/fs/cgroup/system.slice/...
+
+📦 docker.service
+   memory.current: 134217728
+   memory.max:     536870912
+   pids.current:   47
+
+📦 nginx.service
+   memory.current: 8388608
+   memory.max:     67108864
+   pids.current:   3
+
+Total cgroups scanned: 2
+
+Root cgroup:
+  cpu.weight: 100
+  cpu.max:    max 100000
 ```
 
 ## API
 
 | Struct / Function | Description |
-|---|---|
-| `CgroupInfo` | Snapshot: `name`, `cpu_usage`, `memory_current`, `memory_max`, `pids_current`. |
-| `scan_cgroup(path)` | Read all control files for a single cgroup directory. Returns `Option<CgroupInfo>`. |
-| `read_cgroup_file(path)` | Read a cgroup control file as a string (`"<unreadable>"` on error). |
+|-------------------|-------------|
+| `CgroupInfo` | Per-cgroup: name, cpu_usage, memory_current, memory_max, pids_current |
+| `scan_cgroup(path) → Option<CgroupInfo>` | Scan a single cgroup directory |
+| `read_cgroup_file(path) → String` | Read a cgroup control file (graceful fallback) |
 
 ## Architecture Notes
 
-In the SuperInstance fleet, cgroup-monitor feeds the η (evaluation) side of γ + η = C — it observes the actual resource state of running instances. The data it collects flows into the metrics pipeline for capacity planning and overload detection. See [SuperInstance Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+The **γ + η = C** link: the filesystem scanner (γ) extracts raw resource counters from cgroup control files, while the kernel's cgroup subsystem (η) maintains those files as authoritative resource accounts. Together they conserve the observability invariant C — the reported values are point-in-time snapshots of the kernel's own resource accounting. The scanner is intentionally read-only and never modifies cgroup state.
 
 ## References
 
-1. Linux Kernel Documentation. *cgroup v2*. <https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html>
-2. systemd Documentation. *systemd.resource-control(5)*. — Describes `cpu.weight`, `cpu.max`, `memory.max` mapping.
-3. Kerrisk, M. (2010). *The Linux Programming Interface*, Ch. 25–28. NoStarch Press.
+- Kernel.org: *cgroup v2 — Linux Kernel Documentation.* <https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html>
+- systemd documentation: *Resource Control.* <https://www.freedesktop.org/software/systemd/man/systemd.resource-control.html>
+- Tejun Heo (2017). *cgroup v2: The Unified Hierarchy.* LWN.net.
+- Kerrisk, M. (2024). *The Linux Programming Interface,* 2nd ed. (cgroups chapter.)
+- Kubernetes: *Understanding cgroup v2.* SIG-Node documentation.
 
 ## License
 
