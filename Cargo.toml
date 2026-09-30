@@ -2,8 +2,10 @@
 name = "cgroup-monitor"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/casey-digennaro/cgroup-monitor"
+repository = "https://github.com/SuperInstance/cgroup-monitor"
 edition = "2021"
 description = "Linux cgroup v2 monitor and resource usage scanner"
+
+keywords = ["cgroup-monitor"]
 
 [dependencies]
